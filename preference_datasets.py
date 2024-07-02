@@ -144,12 +144,15 @@ def get_hh(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str,
     # dataset = dataset.select(range(100))
     if split=='train':
         dataset = datasets.load_dataset('Anthropic/hh-rlhf', split=split, data_dir="harmless-base", cache_dir=cache_dir)
-        subset = list(range(len(dataset)))
+        # subset = list(range(len(dataset)))
+        subset = list(range(100))
         random.shuffle(subset)
-        dataset = dataset.select(subset[:int(len(dataset)*0.5)])
+        # dataset = dataset.select(subset[:int(len(dataset)*0.5)])
+        dataset = dataset.select(subset)
     else:
         dataset = datasets.load_dataset('Anthropic/hh-rlhf', split=split, data_dir="harmless-base", cache_dir=cache_dir)
-        
+        subset = list(range(100))
+        dataset = dataset.select(subset)
     
     rank0_print(f'len of harmless-base {split}', len(dataset))
     # print('len of helpful-base', len(dataset_2))

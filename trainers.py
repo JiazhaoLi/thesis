@@ -68,14 +68,10 @@ def preference_loss(policy_chosen_logps: torch.FloatTensor,
         The losses tensor contains the DPO loss for each example in the batch.
         The chosen_rewards and rejected_rewards tensors contain the rewards for the chosen and rejected responses, respectively.
     """
-    # rank0_print('policy_chosen_logps', policy_chosen_logps)
-    # rank0_print('policy_rejected_logps', policy_rejected_logps)
-    # rank0_print('reference_chosen_logps', reference_chosen_logps)
-    # rank0_print('reference_rejected_logps', reference_rejected_logps)
+
     pi_logratios = policy_chosen_logps - policy_rejected_logps
     ref_logratios = reference_chosen_logps - reference_rejected_logps
-    # rank0_print('pi_logratios', pi_logratios)
-    # rank0_print('ref_logratios', ref_logratios)
+  
     if reference_free:
         ref_logratios = 0
 
@@ -89,9 +85,7 @@ def preference_loss(policy_chosen_logps: torch.FloatTensor,
 
     chosen_rewards = beta * (policy_chosen_logps - reference_chosen_logps).detach()
     rejected_rewards = beta * (policy_rejected_logps - reference_rejected_logps).detach()
-    # rank0_print('chosen_rewards',chosen_rewards)
-    # rank0_print('rejected_rewards',rejected_rewards)
-    # exit()
+
     return losses, chosen_rewards, rejected_rewards
 
 
@@ -367,7 +361,7 @@ class BasicTrainer(object):
                         rank0_print(f'creating checkpoint to write to {output_dir}...')
                         self.save(output_dir, mean_eval_metrics)
             #### END EVALUATION ####
-            exit()
+            
             #### BEGIN TRAINING ####
             torch.cuda.empty_cache()
             self.policy.train()
@@ -413,6 +407,71 @@ class BasicTrainer(object):
             else:
                 rank0_print(f'skipping logging after {self.example_counter} examples to avoid logging too frequently')
             ### END TRAINING ####
+
+
+        ### after training do the final evaluation 
+        
+        rank0_print(f'Running final evaluation after {self.example_counter} train examples')
+        self.policy.eval()
+
+        all_eval_metrics = defaultdict(list)
+        if self.config.sample_during_eval:
+            all_policy_samples, all_reference_samples = [], []
+            policy_text_table = wandb.Table(columns=["step", "prompt", "sample"])
+            if self.config.loss.name in {'dpo', 'ipo'}:
+                reference_text_table = wandb.Table(columns=["step", "prompt", "sample"])
+
+        for eval_batch in (tqdm.tqdm(self.eval_batches, desc='Computing eval metrics') if self.rank == 0 else self.eval_batches):
+            local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
+            with torch.no_grad():
+                _, eval_metrics = self.get_batch_metrics(local_eval_batch, self.config.loss, train=False)
+
+            for k, v in eval_metrics.items():
+                all_eval_metrics[k].extend(v)
+
+        if self.config.sample_during_eval:
+            if self.config.n_eval_model_samples < self.config.eval_batch_size:
+                rank0_print(f'Warning: n_eval_model_samples ({self.config.n_eval_model_samples}) < eval_batch_size ({self.config.eval_batch_size}). Sampling from the first complete eval batch of prompts.')
+                sample_batches = self.eval_batches[:1]
+            else:
+                n_sample_batches = self.config.n_eval_model_samples // self.config.eval_batch_size
+                sample_batches = self.eval_batches[:n_sample_batches]
+            for eval_batch in (tqdm.tqdm(sample_batches, desc='Generating samples...') if self.rank == 0 else sample_batches):
+                local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
+                policy_samples, reference_samples = self.get_batch_samples(local_eval_batch)
+
+                all_policy_samples.extend(policy_samples)
+                all_reference_samples.extend(reference_samples)
+
+                for prompt, sample in zip(eval_batch['prompt'], policy_samples):
+                    policy_text_table.add_data(self.example_counter, prompt, sample)
+                if self.config.loss.name in {'dpo', 'ipo'}:
+                    for prompt, sample in zip(eval_batch['prompt'], reference_samples):
+                        reference_text_table.add_data(self.example_counter, prompt, sample)
+
+        mean_eval_metrics = {k: sum(v) / len(v) for k, v in all_eval_metrics.items()}
+        rank0_print(f'eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}')
+        if self.config.sample_during_eval:                    
+            rank0_print(json.dumps(all_policy_samples[:10], indent=2))
+            if self.config.loss.name in {'dpo', 'ipo'}:
+                rank0_print(json.dumps(all_reference_samples[:10], indent=2))
+
+        if self.config.wandb.enabled and self.rank == 0:
+            wandb.log(mean_eval_metrics, step=self.example_counter)
+
+            if self.config.sample_during_eval:
+                wandb.log({"policy_samples": policy_text_table}, step=self.example_counter)
+                if self.config.loss.name in {'dpo', 'ipo'}:
+                    wandb.log({"reference_samples": reference_text_table}, step=self.example_counter)
+
+        if self.example_counter > 0:
+            if self.config.debug:
+                rank0_print('skipping save in debug mode')
+            else:
+                output_dir = os.path.join(self.run_dir, f'step-{self.example_counter}')
+                rank0_print(f'creating checkpoint to write to {output_dir}...')
+                self.save(output_dir, mean_eval_metrics)
+
 
     def clip_gradient(self):
         """Clip the gradient norm of the parameters of a non-FSDP policy."""
@@ -523,26 +582,26 @@ class FSDPTrainer(BasicTrainer):
             self.write_state_dict(self.example_counter, policy_state_dict, metrics, 'policy.pt', output_dir)
         del policy_state_dict
         dist.barrier()
-        # gc.collect()
-        # torch.cuda.empty_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
 
-        # save_policy = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        # with FSDP.state_dict_type(self.policy, StateDictType.FULL_STATE_DICT, optim_state_dict_config=save_policy):
-        #     optimizer_state_dict = FSDP.optim_state_dict(self.policy, self.optimizer)
+        save_policy = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(self.policy, StateDictType.FULL_STATE_DICT, optim_state_dict_config=save_policy):
+            optimizer_state_dict = FSDP.optim_state_dict(self.policy, self.optimizer)
 
-        # if self.rank == 0:
-        #     self.write_state_dict(self.example_counter, optimizer_state_dict, metrics, 'optimizer.pt', output_dir)
-        # del optimizer_state_dict
-        # dist.barrier()
-        # gc.collect()
-        # torch.cuda.empty_cache()
+        if self.rank == 0:
+            self.write_state_dict(self.example_counter, optimizer_state_dict, metrics, 'optimizer.pt', output_dir)
+        del optimizer_state_dict
+        dist.barrier()
+        gc.collect()
+        torch.cuda.empty_cache()
 
-        # if self.rank == 0:
-        #     scheduler_state_dict = self.scheduler.state_dict()
-        #     self.write_state_dict(self.example_counter, scheduler_state_dict, metrics, 'scheduler.pt', output_dir)
-        # dist.barrier()
-        # gc.collect()
-        # torch.cuda.empty_cache()
+        if self.rank == 0:
+            scheduler_state_dict = self.scheduler.state_dict()
+            self.write_state_dict(self.example_counter, scheduler_state_dict, metrics, 'scheduler.pt', output_dir)
+        dist.barrier()
+        gc.collect()
+        torch.cuda.empty_cache()
         
 
 class TensorParallelTrainer(BasicTrainer):
